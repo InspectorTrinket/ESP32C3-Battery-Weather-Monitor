@@ -340,7 +340,8 @@ void trigger_bme_measurement() {
     Wire.endTransmission();
 }
 
-void wait_for_bme_measurement() {
+bool wait_for_bme_measurement() {
+    unsigned long start = millis();
     while (true) {
         Wire.beginTransmission(BME280_I2C_ADDR);
         Wire.write(0xF3);                // status register
@@ -349,8 +350,9 @@ void wait_for_bme_measurement() {
         Wire.requestFrom((uint8_t)BME280_I2C_ADDR, (uint8_t)1);
         if (Wire.available()) {
             uint8_t status = Wire.read();
-            if (!(status & 0x08)) break; // bit 3 = measuring
+            if (!(status & 0x08)) return true; // bit 3 = measuring
         }
+        if (millis() - start > BME280_MEASURE_TIMEOUT_MS) return false;
         delay(1);
     }
 }
@@ -411,8 +413,11 @@ void setup() {
         if (!mqtt.connected()) mqtt_connect();
     }
 
-    // Wait for BME280 measurement to complete
-    wait_for_bme_measurement();
+    // Wait for BME280 measurement to complete — bails out to sleep rather
+    // than hanging forever if the sensor never clears the measuring bit
+    if (!wait_for_bme_measurement()) {
+        go_to_sleep(SLEEP_DURATION_US);
+    }
 
     // Now read all values (they are ready)
     float temperature = bme.readTemperature();

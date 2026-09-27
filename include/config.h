@@ -27,6 +27,15 @@
 // Maximum time to wait for MQTT broker connection (ms)
 #define MQTT_TIMEOUT_MS     3000
 
+// Maximum time to wait for the BME280 forced-mode conversion to finish (ms).
+// Max conversion time at current oversampling (T=16x, P=4x, H=4x) is ~58ms
+// per the datasheet formula; 300ms gives comfortable margin even if the
+// oversampling settings above are later increased. Guards against an I2C
+// glitch leaving the status register stuck at "measuring" forever — without
+// this, wait_for_bme_measurement() would hang with WiFi/MQTT already
+// connected, draining the battery at full active current until it dies.
+#define BME280_MEASURE_TIMEOUT_MS   300
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Hardware pins  (XIAO ESP32C3)
 // ─────────────────────────────────────────────────────────────────────────────
