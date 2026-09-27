@@ -39,7 +39,7 @@
 // network configuration changes (IP, broker address, WiFi credentials).
 // This forces a clean cold-boot re-initialisation on the next wake after
 // flashing, so the updated discovery payload actually reaches the broker.
-#define RTC_MAGIC  0xBEEF123CUL   // bumped: added MAC to device "cns" (connections)
+#define RTC_MAGIC  0xBEEF123DUL   // bumped: entities now share one state topic + val_tpl
 
 RTC_NOINIT_ATTR struct {
     uint32_t magic;           // == RTC_MAGIC when struct is valid
@@ -67,7 +67,6 @@ Adafruit_BME280 bme;
 bool wifi_connect() {
     WiFi.persistent(false);            // never write credentials to NVS flash
     WiFi.mode(WIFI_STA);
-    WiFi.setTxPower(WIFI_TX_POWER);    // reduce radio TX current — see config.h for margin rationale
     WiFi.setSleep(false);              // power_save_mode: none — no RF duty-cycling
                                        // during the active window; saves ~50 ms
                                        // association time and improves reliability.
@@ -194,15 +193,14 @@ void publish_discovery() {
     };
 
     char cfg_topic[100];
-    char state_topic[100];
+    char state_topic[60];
+    snprintf(state_topic, sizeof(state_topic), "%s/state", DEVICE_NAME);
     char ent_cat_field[30];
     char payload[512];
 
     for (const auto& e : entities) {
         snprintf(cfg_topic,   sizeof(cfg_topic),
                  "homeassistant/sensor/%s/%s/config", DEVICE_NAME, e.id);
-        snprintf(state_topic, sizeof(state_topic),
-                 "%s/sensor/%s/state", DEVICE_NAME, e.id);
 
         if (e.ent_cat) {
             snprintf(ent_cat_field, sizeof(ent_cat_field),
@@ -211,17 +209,20 @@ void publish_discovery() {
             ent_cat_field[0] = '\0';
         }
 
+        // All entities share one state topic (see publish_sensors) — val_tpl
+        // picks this entity's field out of the combined JSON payload.
         // Abbreviated HA MQTT discovery keys — standard short forms
         snprintf(payload, sizeof(payload),
                  "{"
                  "\"name\":\"%s\","
                  "\"stat_t\":\"%s\","
+                 "\"val_tpl\":\"{{ value_json.%s }}\","
                  "\"uniq_id\":\"%s_%s\","
                  "\"dev_cla\":\"%s\","
                  "\"unit_of_meas\":\"%s\","
                  "\"stat_cla\":\"measurement\"%s%s"
                  "}",
-                 e.name, state_topic,
+                 e.name, state_topic, e.id,
                  mac_str, e.id,
                  e.dev_cla,
                  e.unit,
@@ -236,53 +237,41 @@ void publish_discovery() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Sensor data publishing
 //
-// States are published with retain=true so HA always has the last known
-// value even after a broker restart while the device is sleeping.
-// An asymmetric gap (MQTT_PUB_BASE_GAP_MS) follows each publish, growing
-// every two publishes to match TCP send window growth. On failure, the
-// retry path drains with MQTT_PUB_DRAIN_COUNT / MQTT_PUB_DRAIN_DELAY_MS
-// before retrying once.
+// All 7 readings are bundled into one retained JSON message on a single
+// topic. The original design published each value as its own message —
+// firing several of those back-to-back in one wake cycle is what exhausted
+// the ESP32's TCP send window and dropped the later ones. A single ~150
+// byte payload never triggers that, so the inter-publish gap/drain scheme
+// this used to need is gone; only the failure-retry path remains.
 // ─────────────────────────────────────────────────────────────────────────────
 void publish_sensors(float temp, float pres, float humi,
                      float vbat, float pct, int rssi, uint32_t wake_ms) {
-    char topic[80];
-    char val[20];
+    char topic[60];
+    snprintf(topic, sizeof(topic), "%s/state", DEVICE_NAME);
 
-    // Publishes a single value. Checks connection before each publish and
-    // retries on failure — mqtt.publish() returns false silently if the TCP
-    // write fails mid-sequence. Checking connected() alone is insufficient
-    // because the socket can break during the write itself, leaving connected()
-    // still returning true until the next mqtt.loop() detects the dead socket.
-    int pub_idx = 0;
-    auto pub = [&](const char* id, const char* v) {
-        if (!mqtt.connected()) mqtt_connect();
-        snprintf(topic, sizeof(topic), "%s/sensor/%s/state", DEVICE_NAME, id);
-        if (!mqtt.publish(topic, v, /*retain=*/true)) {
-            // Publish failed — drain first to clear the TCP send window,
-            // then retry. Only reconnect if the connection actually dropped.
-            for (int i = 0; i < MQTT_PUB_DRAIN_COUNT; i++) {
-                mqtt.loop();
-                delay(MQTT_PUB_DRAIN_DELAY_MS);
-            }
-            if (!mqtt.connected()) mqtt_connect();
-            // Retry the publish
-            mqtt.publish(topic, v, /*retain=*/true);
+    char payload[220];
+    snprintf(payload, sizeof(payload),
+             "{\"temperature\":%.2f,\"pressure\":%.2f,\"relative_humidity\":%.3f,"
+             "\"battery_voltage\":%.4f,\"battery_level\":%.0f,\"net_rssi\":%d,"
+             "\"wake_duration\":%lu}",
+             temp, pres, humi, vbat, pct, rssi, wake_ms);
+
+    // mqtt.publish() returns false silently if the TCP write fails. Checking
+    // connected() alone is insufficient because the socket can break during
+    // the write itself, leaving connected() still true until the next
+    // mqtt.loop() detects the dead socket.
+    if (!mqtt.connected()) mqtt_connect();
+    if (!mqtt.publish(topic, payload, /*retain=*/true)) {
+        // Drain first to clear the TCP send window, then retry once. Only
+        // reconnect if the connection actually dropped.
+        for (int i = 0; i < MQTT_PUB_DRAIN_COUNT; i++) {
+            mqtt.loop();
+            delay(MQTT_PUB_DRAIN_DELAY_MS);
         }
-        // Asymmetric inter-publish gap — increases every two publishes to match
-        // TCP send window growth. First publish needs no gap; later ones need more.
-        int gap_ms = (pub_idx == 0) ? 0 : ((pub_idx + 1) / 2) * MQTT_PUB_BASE_GAP_MS;
-        mqtt.loop();
-        if (gap_ms > 0) delay(gap_ms);
-        pub_idx++;
-    };
-
-    snprintf(val, sizeof(val), "%.2f",  temp);    pub("temperature",       val);
-    snprintf(val, sizeof(val), "%.2f",  pres);    pub("pressure",          val);
-    snprintf(val, sizeof(val), "%.3f",  humi);    pub("relative_humidity", val);
-    snprintf(val, sizeof(val), "%.4f",  vbat);    pub("battery_voltage",   val);
-    snprintf(val, sizeof(val), "%.0f",  pct);     pub("battery_level",     val);
-    snprintf(val, sizeof(val), "%d",    rssi);    pub("net_rssi",          val);
-    snprintf(val, sizeof(val), "%lu",   wake_ms); pub("wake_duration",     val);
+        if (!mqtt.connected()) mqtt_connect();
+        mqtt.publish(topic, payload, /*retain=*/true);
+    }
+    mqtt.loop();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -351,7 +340,8 @@ void trigger_bme_measurement() {
     Wire.endTransmission();
 }
 
-void wait_for_bme_measurement() {
+bool wait_for_bme_measurement() {
+    unsigned long start = millis();
     while (true) {
         Wire.beginTransmission(BME280_I2C_ADDR);
         Wire.write(0xF3);                // status register
@@ -360,8 +350,9 @@ void wait_for_bme_measurement() {
         Wire.requestFrom((uint8_t)BME280_I2C_ADDR, (uint8_t)1);
         if (Wire.available()) {
             uint8_t status = Wire.read();
-            if (!(status & 0x08)) break; // bit 3 = measuring
+            if (!(status & 0x08)) return true; // bit 3 = measuring
         }
+        if (millis() - start > BME280_MEASURE_TIMEOUT_MS) return false;
         delay(1);
     }
 }
@@ -422,8 +413,11 @@ void setup() {
         if (!mqtt.connected()) mqtt_connect();
     }
 
-    // Wait for BME280 measurement to complete
-    wait_for_bme_measurement();
+    // Wait for BME280 measurement to complete — bails out to sleep rather
+    // than hanging forever if the sensor never clears the measuring bit
+    if (!wait_for_bme_measurement()) {
+        go_to_sleep(SLEEP_DURATION_US);
+    }
 
     // Now read all values (they are ready)
     float temperature = bme.readTemperature();
