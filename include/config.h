@@ -16,15 +16,6 @@
 #define SUBNET_MASK  "255.255.255.0"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WiFi radio
-// ─────────────────────────────────────────────────────────────────────────────
-// TX power. 
-// Options (arduino-esp32 wifi_power_t, high to low):
-//   WIFI_POWER_19_5dBm (default/max), 19dBm, 18_5dBm, 17dBm, 15dBm, 13dBm,
-//   WIFI_POWER_11dBm, 8_5dBm, 7dBm, 5dBm, 2dBm, MINUS_1dBm (min)
-#define WIFI_TX_POWER   WIFI_POWER_11dBm
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Timing
 // ─────────────────────────────────────────────────────────────────────────────
 // Deep-sleep duration between measurements (microseconds)
@@ -35,6 +26,15 @@
 
 // Maximum time to wait for MQTT broker connection (ms)
 #define MQTT_TIMEOUT_MS     3000
+
+// Maximum time to wait for the BME280 forced-mode conversion to finish (ms).
+// Max conversion time at current oversampling (T=16x, P=4x, H=4x) is ~58ms
+// per the datasheet formula; 300ms gives comfortable margin even if the
+// oversampling settings above are later increased. Guards against an I2C
+// glitch leaving the status register stuck at "measuring" forever — without
+// this, wait_for_bme_measurement() would hang with WiFi/MQTT already
+// connected, draining the battery at full active current until it dies.
+#define BME280_MEASURE_TIMEOUT_MS   300
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hardware pins  (XIAO ESP32C3)
@@ -94,14 +94,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // MQTT publish pacing
 // ─────────────────────────────────────────────────────────────────────────────
-// Base gap (ms) for the asymmetric inter-publish drain.
-// Formula: gap = (N == 0) ? 0 : ((N + 1) / 2) * MQTT_PUB_BASE_GAP_MS
-// Matches TCP send window growth early publishes need no drain, later
-// ones need progressively more.
-#define MQTT_PUB_BASE_GAP_MS    5
-
-// Inter-publish TCP drain used only in the retry path (when a publish fails).
-// Each iteration = MQTT_PUB_DRAIN_DELAY_MS ms.
+// All 7 readings go out as one combined JSON publish (see publish_sensors in
+// main.cpp), so there's no inter-publish gap to tune — a single small
+// payload never fills the TCP send window the way 7 back-to-back publishes
+// used to. These two only apply if that one publish fails outright:
+// drain first (to clear the send window), then retry once.
 #define MQTT_PUB_DRAIN_COUNT      2
 #define MQTT_PUB_DRAIN_DELAY_MS   5
 
