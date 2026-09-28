@@ -323,23 +323,8 @@ float battery_percent(float vbat) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BME280 direct I2C helpers — trigger and poll measurement without blocking
+// BME280 direct I2C helper — poll measurement status without blocking
 // ─────────────────────────────────────────────────────────────────────────────
-void trigger_bme_measurement() {
-    // Construct ctrl_meas (0xF4) directly from config.h oversampling values.
-    // Adafruit sampling enum values equal the osrs bit field values directly:
-    //   SAMPLING_X1=1, X2=2, X4=3, X8=4, X16=5
-    // bits 7:5 = osrs_t, bits 4:2 = osrs_p, bits 1:0 = mode=01 (forced)
-    // This is authoritative — no dependency on library internal state or register readback.
-    uint8_t ctrl = ((BME280_TEMP_OVERSAMPLING  & 0x07) << 5) |
-                   ((BME280_PRESS_OVERSAMPLING & 0x07) << 2) |
-                   0x01;   // forced mode
-    Wire.beginTransmission(BME280_I2C_ADDR);
-    Wire.write(0xF4);
-    Wire.write(ctrl);
-    Wire.endTransmission();
-}
-
 bool wait_for_bme_measurement() {
     unsigned long start = millis();
     while (true) {
@@ -373,7 +358,13 @@ void setup() {
     // I2C
     Wire.begin(I2C_SDA, I2C_SCL);
 
-    // BME280 — trigger measurement early so it runs in parallel with WiFi+MQTT connect
+    // BME280 — setSampling(MODE_FORCED, ...) resets the sensor to sleep mode
+    // first, then writes the forced-mode bits as its last register write
+    // (confirmed in the library source: write8(CONTROL, MODE_SLEEP) precedes
+    // the final write8(CONTROL, _measReg)). That sleep→forced transition is
+    // what starts the conversion — there's no separate trigger call needed.
+    // Placed before WiFi connects so the ~58ms conversion runs in parallel
+    // with WiFi+MQTT connect instead of adding to the wake time.
     if (!bme.begin(BME280_I2C_ADDR)) {
         go_to_sleep(SLEEP_DURATION_US); // sensor absent — skip cycle
     }
@@ -385,8 +376,6 @@ void setup() {
         Adafruit_BME280::FILTER_OFF,
         Adafruit_BME280::STANDBY_MS_0_5
     );
-    // Trigger forced measurement using direct I2C (non‑blocking)
-    trigger_bme_measurement();
 
     // WiFi
     if (!wifi_connect()) {
@@ -440,12 +429,15 @@ void setup() {
     publish_sensors(temperature, pressure, humidity, vbat, pct, rssi,
                     static_cast<uint32_t>(millis() - wake_start_ms));
 
-    // Final drain — gives TCP stack time to send the last publish before WiFi stops
-    if (!mqtt.connected()) mqtt_connect();
-    for (int i = 0; i < 10; i++) {   // 10 × 5ms = 50ms
-        mqtt.loop();
-        delay(5);
-    }
+    // End the session cleanly. disconnect() (PubSubClient) writes the
+    // DISCONNECT packet, then calls the client's flush() — which blocks
+    // until the TCP send buffer is actually drained — before closing the
+    // socket. Confirmed in the library source: this waits for the prior
+    // publish to actually leave, rather than guessing a fixed delay is
+    // long enough. Only the retry-on-failure path (inside publish_sensors)
+    // still needs the fixed drain, since that's recovering from a write
+    // that already failed, not draining one that succeeded.
+    mqtt.disconnect();
 
     go_to_sleep(SLEEP_DURATION_US);
 }
