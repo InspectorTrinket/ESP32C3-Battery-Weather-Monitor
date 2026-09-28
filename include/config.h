@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #define DEVICE_NAME         "meteo-teste"
 #define FRIENDLY_NAME       "Meteo Teste"
-#define DEVICE_MODEL        "esp32c3_bme280"
+#define DEVICE_MODEL        "esp32c3+bme280_weather_monitor"
 #define DEVICE_MANUFACTURER "victorzwk"
 
 // ─────────────────────────────────────────────────────────────────────────────
