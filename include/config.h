@@ -5,7 +5,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #define DEVICE_NAME         "meteo-teste"
 #define FRIENDLY_NAME       "Meteo Teste"
-#define DEVICE_MODEL        "esp32c3+bme280_weather_monitor"
+#define DEVICE_MODEL        "esp32c3_bme280"
 #define DEVICE_MANUFACTURER "victorzwk"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,10 +94,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // MQTT publish pacing
 // ─────────────────────────────────────────────────────────────────────────────
-// All 7 readings go out as one combined JSON publish (see publish_sensors in
-// main.cpp), so there's no inter-publish gap to tune — a single small
-// payload never fills the TCP send window the way 7 back-to-back publishes
-// used to. These two only apply if that one publish fails outright:
+// Only apply if the publish fails outright:
 // drain first (to clear the send window), then retry once.
 #define MQTT_PUB_DRAIN_COUNT      2
 #define MQTT_PUB_DRAIN_DELAY_MS   5
@@ -105,5 +102,5 @@
 // MQTT broker TCP port
 #define MQTT_PORT   1883
 
-// Must be ≥ largest single publish payload (~370B for discovery). 1024 is safe.
+// Must be > largest single publish payload (~370B for discovery). 1024 is safe.
 #define MQTT_BUFFER_BYTES   1024

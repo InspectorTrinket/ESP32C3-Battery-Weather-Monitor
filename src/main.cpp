@@ -39,7 +39,7 @@
 // network configuration changes (IP, broker address, WiFi credentials).
 // This forces a clean cold-boot re-initialisation on the next wake after
 // flashing, so the updated discovery payload actually reaches the broker.
-#define RTC_MAGIC  0xBEEF123DUL   // bumped: entities now share one state topic + val_tpl
+#define RTC_MAGIC  0xBEEF1240UL
 
 RTC_NOINIT_ATTR struct {
     uint32_t magic;           // == RTC_MAGIC when struct is valid
@@ -323,23 +323,8 @@ float battery_percent(float vbat) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BME280 direct I2C helpers — trigger and poll measurement without blocking
+// BME280 direct I2C helper — poll measurement status without blocking
 // ─────────────────────────────────────────────────────────────────────────────
-void trigger_bme_measurement() {
-    // Construct ctrl_meas (0xF4) directly from config.h oversampling values.
-    // Adafruit sampling enum values equal the osrs bit field values directly:
-    //   SAMPLING_X1=1, X2=2, X4=3, X8=4, X16=5
-    // bits 7:5 = osrs_t, bits 4:2 = osrs_p, bits 1:0 = mode=01 (forced)
-    // This is authoritative — no dependency on library internal state or register readback.
-    uint8_t ctrl = ((BME280_TEMP_OVERSAMPLING  & 0x07) << 5) |
-                   ((BME280_PRESS_OVERSAMPLING & 0x07) << 2) |
-                   0x01;   // forced mode
-    Wire.beginTransmission(BME280_I2C_ADDR);
-    Wire.write(0xF4);
-    Wire.write(ctrl);
-    Wire.endTransmission();
-}
-
 bool wait_for_bme_measurement() {
     unsigned long start = millis();
     while (true) {
@@ -373,7 +358,13 @@ void setup() {
     // I2C
     Wire.begin(I2C_SDA, I2C_SCL);
 
-    // BME280 — trigger measurement early so it runs in parallel with WiFi+MQTT connect
+    // BME280 — setSampling(MODE_FORCED, ...) resets the sensor to sleep mode
+    // first, then writes the forced-mode bits as its last register write
+    // (confirmed in the library source: write8(CONTROL, MODE_SLEEP) precedes
+    // the final write8(CONTROL, _measReg)). That sleep→forced transition is
+    // what starts the conversion — there's no separate trigger call needed.
+    // Placed before WiFi connects so the ~58ms conversion runs in parallel
+    // with WiFi+MQTT connect instead of adding to the wake time.
     if (!bme.begin(BME280_I2C_ADDR)) {
         go_to_sleep(SLEEP_DURATION_US); // sensor absent — skip cycle
     }
@@ -385,8 +376,6 @@ void setup() {
         Adafruit_BME280::FILTER_OFF,
         Adafruit_BME280::STANDBY_MS_0_5
     );
-    // Trigger forced measurement using direct I2C (non‑blocking)
-    trigger_bme_measurement();
 
     // WiFi
     if (!wifi_connect()) {
@@ -403,10 +392,6 @@ void setup() {
     if (!rtc.discovery_done) {
         publish_discovery();
         rtc.discovery_done = true;
-        
-        // Full flush after discovery — 7 retained messages (~370 bytes each)
-        // need time to clear the broker's ACK queue before publishing sensors.
-        // 10 × 10ms = 100ms is sufficient on a local broker.
         for (int i = 0; i < 10; i++) { mqtt.loop(); delay(10); }
         
         // Reconnect if discovery exhausted the connection
@@ -440,12 +425,22 @@ void setup() {
     publish_sensors(temperature, pressure, humidity, vbat, pct, rssi,
                     static_cast<uint32_t>(millis() - wake_start_ms));
 
-    // Final drain — gives TCP stack time to send the last publish before WiFi stops
+    // Final drain — gives the WiFi/TCP stack actual wall-clock time to
+    // transmit the publish before anything closes. This is what makes this
+    // safe, NOT mqtt.disconnect() below: WiFiClient::flush() on this core
+    // only clears the RX buffer, so disconnect() alone (confirmed against
+    // the ESP32 core source) gives zero guarantee the prior publish has
+    // left the device before stop() abruptly drops the socket.
+    // 10 × 5ms = 50ms — proven reliable over 6+ months in production.
     if (!mqtt.connected()) mqtt_connect();
-    for (int i = 0; i < 10; i++) {   // 10 × 5ms = 50ms
+    for (int i = 0; i < 10; i++) {
         mqtt.loop();
         delay(5);
     }
+
+    // Clean protocol-level goodbye now that the data is actually out —
+    // purely a nicety at this point, not what provides the guarantee above.
+    mqtt.disconnect();
 
     go_to_sleep(SLEEP_DURATION_US);
 }
